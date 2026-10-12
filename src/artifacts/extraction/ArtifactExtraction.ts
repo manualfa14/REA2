@@ -18,6 +18,10 @@ import { SafeOutputTree } from "../SafeOutputTree.js";
 import { SafeOutputTreeCreationFailure } from "../SafeOutputTreeCreationFailure.js";
 import { ZipArtifactReader } from "../ZipArtifactReader.js";
 import { MachOSliceArtifactReader } from "../MachOSliceArtifactReader.js";
+import { PyInstallerArtifactReader } from "../PyInstallerArtifactReader.js";
+import { containsPyInstallerArchive } from "../pyinstaller/CArchiveLayout.js";
+import { OwnedFileHandle } from "../../filesystem/OwnedFileHandle.js";
+import { openRegularFile } from "../../filesystem/RegularFile.js";
 import {
   artifactExtractionResultSchema,
   type ArtifactExtractionResult,
@@ -422,7 +426,11 @@ const requireExtractableFormat = async (
     !directory &&
     format !== "asar" &&
     !isMachOFormat(format) &&
-    !isZipFormat(format)
+    !isZipFormat(format) &&
+    !(
+      (format === "elf" || format === "pe") &&
+      (await pathContainsPyInstallerArchive(path))
+    )
   )
     throw new AnalysisUnsupportedTargetError(
       "extract_artifact",
@@ -444,7 +452,24 @@ const createReader = async (
     return new DirectoryArtifactReader(path);
   if (format === "asar") return new AsarArtifactReader(path);
   if (isZipFormat(format)) return new ZipArtifactReader(path, format);
+  if (
+    (format === "elf" || format === "pe" || isMachOFormat(format)) &&
+    (await pathContainsPyInstallerArchive(path))
+  )
+    return new PyInstallerArtifactReader(path);
   return new MachOSliceArtifactReader(path, input.environment);
+};
+
+const pathContainsPyInstallerArchive = async (
+  path: string,
+): Promise<boolean> => {
+  const handle = await openRegularFile(path, { symlinks: "reject" });
+  const owner = new OwnedFileHandle(handle);
+  try {
+    return await containsPyInstallerArchive(handle, (await handle.stat()).size);
+  } finally {
+    await owner.close();
+  }
 };
 
 const preflight = (entry: ArtifactEntry): void => {

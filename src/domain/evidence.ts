@@ -70,6 +70,7 @@ const subjectSchema = z.object({
     "mach-o-universal",
     "javascript-bundle",
     "entitlements",
+    "pyinstaller",
   ]),
   architecture: z.enum(BINARY_ARCHITECTURES).nullable(),
   local_path: nulFreeStringSchema,

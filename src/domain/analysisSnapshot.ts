@@ -84,6 +84,7 @@ const subjectSchema = z.object({
     "unknown",
     "javascript-bundle",
     "entitlements",
+    "pyinstaller",
   ]),
   architecture: architectureSchema.nullable(),
 });
