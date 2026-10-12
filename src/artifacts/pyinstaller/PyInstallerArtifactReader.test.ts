@@ -2,9 +2,10 @@ import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 
 import { ArtifactReaderFailure } from "../ArtifactReader.js";
+import { OwnedFileHandle } from "../../filesystem/OwnedFileHandle.js";
 import { materializeArtifactInventory } from "../../../tests/fixtures/artifactInventory.js";
 import { scanCanonicalArtifactInventory } from "../../../tests/fixtures/artifactInventory.js";
 import { createTestTempDirectory } from "../../../tests/fixtures/temporaryDirectory.js";
@@ -391,4 +392,180 @@ it("rejects a zlib member that expands past its declared size", async () => {
   await expect(scanCanonicalArtifactInventory(path)).rejects.toMatchObject({
     reason: "limit",
   });
+});
+
+it("reads a compressed member whose uncompressed size is zero", async () => {
+  const path = await writeArchive(
+    "empty-compressed",
+    cArchiveExecutable({
+      layout: "2.1",
+      pythonVersion: 309,
+      pythonLibrary: "libpython3.9.so",
+      members: [
+        {
+          name: "empty.bin",
+          typeCode: "x",
+          payload: Buffer.alloc(0),
+          compress: true,
+        },
+        {
+          name: "empty.py",
+          typeCode: "s",
+          payload: Buffer.alloc(0),
+          compress: true,
+        },
+        {
+          name: "PYZ.pyz",
+          typeCode: "z",
+          payload: pyzArchive({
+            magic: PYTHON_39_MAGIC,
+            modules: [{ name: "app", typeCode: 0, body: Buffer.from("app") }],
+          }),
+          compress: false,
+        },
+      ],
+    }),
+  );
+  const snapshot = await scanCanonicalArtifactInventory(path);
+  expect(
+    snapshot.nodes.find((node) => node.sha256 === sha256(Buffer.alloc(0))),
+  ).toMatchObject({ size: 0 });
+  expect(
+    snapshot.nodes.find(
+      (node) => node.sha256 === sha256(derived(Buffer.alloc(0))),
+    ),
+  ).toMatchObject({ size: derived(Buffer.alloc(0)).length });
+
+  const expanded = await writeArchive(
+    "zero-declared",
+    cArchiveExecutable({
+      layout: "2.1",
+      pythonVersion: 309,
+      pythonLibrary: "libpython3.9.so",
+      members: [
+        {
+          name: "expand.bin",
+          typeCode: "x",
+          payload: Buffer.from("x"),
+          compress: true,
+          declaredUncompressedSize: 0,
+        },
+      ],
+    }),
+  );
+  await expect(scanCanonicalArtifactInventory(expanded)).rejects.toMatchObject({
+    reason: "limit",
+  });
+});
+
+it("preserves an uppercase Z ZIP member as a readable file", async () => {
+  const zip = Buffer.from("PK\u0003\u0004zip-member");
+  const path = await writeArchive(
+    "zip-member",
+    cArchiveExecutable({
+      layout: "2.1",
+      pythonVersion: 309,
+      pythonLibrary: "libpython3.9.so",
+      members: [
+        {
+          name: "payload.zip",
+          typeCode: "Z",
+          payload: zip,
+          compress: false,
+        },
+      ],
+    }),
+  );
+  const snapshot = await scanCanonicalArtifactInventory(path);
+  expect(
+    snapshot.occurrences.map((occurrence) => occurrence.logical_path).sort(),
+  ).toEqual([".", "payload.zip"]);
+  expect(
+    snapshot.occurrences.find(
+      (occurrence) => occurrence.logical_path === "payload.zip",
+    ),
+  ).toMatchObject({
+    entry_kind: "file",
+    limitations: expect.arrayContaining(["PyInstaller type code Z."]),
+  });
+  expect(
+    snapshot.nodes.find((node) => node.sha256 === sha256(zip)),
+  ).toMatchObject({ size: zip.length });
+});
+
+it("keeps a PYZ data entry resource path", async () => {
+  const body = Buffer.from('{"enabled":true}');
+  const path = await writeArchive(
+    "pyz-data",
+    cArchiveExecutable({
+      layout: "2.1",
+      pythonVersion: 309,
+      pythonLibrary: "libpython3.9.so",
+      members: [
+        {
+          name: "PYZ.pyz",
+          typeCode: "z",
+          payload: pyzArchive({
+            magic: PYTHON_39_MAGIC,
+            modules: [{ name: "pkg/config.json", typeCode: 2, body }],
+          }),
+          compress: false,
+        },
+      ],
+    }),
+  );
+  const snapshot = await scanCanonicalArtifactInventory(path);
+  expect(
+    snapshot.occurrences.map((occurrence) => occurrence.logical_path).sort(),
+  ).toEqual([".", "PYZ.pyz", "PYZ.pyz/pkg/config.json"]);
+  expect(
+    snapshot.occurrences.find(
+      (occurrence) => occurrence.logical_path === "PYZ.pyz/pkg/config.json",
+    ),
+  ).toMatchObject({ entry_kind: "file" });
+  expect(
+    snapshot.nodes.find((node) => node.sha256 === sha256(body)),
+  ).toMatchObject({ size: body.length });
+});
+
+it("retains the file owner after a failed close", async () => {
+  const path = await writeArchive(
+    "close-owner",
+    cArchiveExecutable({
+      layout: "2.1",
+      pythonVersion: 309,
+      pythonLibrary: "libpython3.9.so",
+      members: [
+        {
+          name: "data.bin",
+          typeCode: "x",
+          payload: Buffer.from("data"),
+          compress: false,
+        },
+      ],
+    }),
+  );
+  const reader = new PyInstallerArtifactReader(path);
+  for await (const entry of reader.entries()) void entry;
+  const originalClose = OwnedFileHandle.prototype.close;
+  const owners: OwnedFileHandle[] = [];
+  const closeFailure = new Error("close failed");
+  let attempts = 0;
+  const close = vi
+    .spyOn(OwnedFileHandle.prototype, "close")
+    .mockImplementation(async function (this: OwnedFileHandle) {
+      owners.push(this);
+      attempts += 1;
+      if (attempts === 1) throw closeFailure;
+      await originalClose.call(this);
+    });
+  try {
+    await expect(reader.close()).rejects.toBe(closeFailure);
+    await reader.close();
+    expect(attempts).toBe(2);
+    expect(owners[0]).toBe(owners[1]);
+  } finally {
+    close.mockRestore();
+    await reader.close();
+  }
 });

@@ -111,9 +111,9 @@ export class PyInstallerArtifactReader implements ArtifactReader {
   }
 
   async close(): Promise<void> {
-    const owner = this.#owner;
+    if (this.#owner === undefined) return;
+    await this.#owner.close();
     this.#owner = undefined;
-    await owner?.close();
   }
 
   async #load(signal?: AbortSignal): Promise<LoadedArchive> {
@@ -187,7 +187,7 @@ export class PyInstallerArtifactReader implements ArtifactReader {
   ): Promise<ReadonlyMap<string, PyzImage>> {
     const images = new Map<string, PyzImage>();
     for (const entry of toc) {
-      if (entry.typeCode !== "z" && entry.typeCode !== "Z") continue;
+      if (entry.typeCode !== "z") continue;
       abortIfNeeded(signal);
       const bytes = await this.#readDeclared(handle, cookie, entry);
       const parsed = parsePyzArchive(bytes);

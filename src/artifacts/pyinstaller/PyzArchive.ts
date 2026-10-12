@@ -96,7 +96,7 @@ export const inflateBounded = async (
   bytes: Buffer,
   maxOutputBytes: number,
 ): Promise<Result<Buffer, PyInstallerFailure>> => {
-  if (maxOutputBytes <= 0)
+  if (maxOutputBytes < 0)
     return err(
       pyInstallerFailure(
         "limit",
@@ -104,7 +104,19 @@ export const inflateBounded = async (
       ),
     );
   try {
-    return ok(await inflate(bytes, { maxOutputLength: maxOutputBytes }));
+    // Node requires a positive cap. One byte still validates an empty stream
+    // and rejects any produced output when the declared size is zero.
+    const output = await inflate(bytes, {
+      maxOutputLength: maxOutputBytes === 0 ? 1 : maxOutputBytes,
+    });
+    if (output.length > maxOutputBytes)
+      return err(
+        pyInstallerFailure(
+          "limit",
+          "Compressed member exceeds the decompression budget",
+        ),
+      );
+    return ok(output);
   } catch (cause: unknown) {
     if (isOutputLimit(cause))
       return err(

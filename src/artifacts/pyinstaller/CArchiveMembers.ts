@@ -199,6 +199,8 @@ export const projectPyzMember = (
 };
 
 const pyzPath = (container: string, item: PyzEntry): string => {
+  // Type 2 names are resource paths, not dotted module names.
+  if (item.typeCode === 2) return `${container}/${item.name}`;
   const dotted = item.name.replaceAll(".", "/");
   if (item.namespace) return `${container}/${dotted}`;
   if (item.package) return `${container}/${dotted}/__init__.pyc`;
