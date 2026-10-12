@@ -49,8 +49,10 @@ export const projectStoredMember = (
       ? reconstructedPycHeader(pythonMagic)
       : undefined;
   const named = canonicalMemberName(entry.name);
+  const symlink = entry.typeCode === "n";
   const limitations = memberLimitations(entry.typeCode, entry.compressionFlag);
   limitations.push(...originalNameLimitation(named.original));
+  if (symlink) limitations.push("PyInstaller symlink target was not read.");
   if (header !== undefined && bytes !== undefined) {
     limitations.push(RECONSTRUCTED_PYTHON_HEADER_LIMITATION);
     limitations.push(`Uncompressed sha256 ${sha256(bytes)}.`);
@@ -60,6 +62,7 @@ export const projectStoredMember = (
   return {
     entry: fileEntry({
       path: named.path,
+      kind: symlink ? "symlink" : "file",
       declaredSize,
       compressedSize: entry.compressedSize,
       byteOffset: sourceByteOffset(
@@ -300,9 +303,10 @@ const fileEntry = (input: {
   readonly limitations: readonly string[];
   readonly adapterKey: string;
   readonly encrypted?: boolean;
+  readonly kind?: "file" | "symlink";
 }): ArtifactEntry => ({
   path: input.path,
-  kind: "file",
+  kind: input.kind ?? "file",
   declaredSize: input.declaredSize,
   compressedSize: input.compressedSize,
   executable: false,

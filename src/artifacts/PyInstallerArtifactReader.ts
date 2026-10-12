@@ -155,6 +155,8 @@ export class PyInstallerArtifactReader implements ArtifactReader {
       this.#owner = new OwnedFileHandle(handle);
       return handle;
     } catch (cause: unknown) {
+      if (cause instanceof RegularFileAdmissionFailure)
+        this.#owner = cause.owner;
       throw openFailure(this.path, cause);
     }
   }

@@ -528,6 +528,63 @@ it("keeps a PYZ data entry resource path", async () => {
   ).toMatchObject({ size: body.length });
 });
 
+it("projects CArchive type n entries as symlinks", async () => {
+  const target = Buffer.from("libfoo.so.1\0");
+  const payload = Buffer.from("stored-data");
+  const path = await writeArchive(
+    "symlink",
+    cArchiveExecutable({
+      layout: "2.1",
+      pythonVersion: 309,
+      pythonLibrary: "libpython3.9.so",
+      members: [
+        {
+          name: "libfoo.so",
+          typeCode: "n",
+          payload: target,
+          compress: false,
+        },
+        { name: "data.bin", typeCode: "x", payload, compress: false },
+      ],
+    }),
+  );
+  const snapshot = await scanCanonicalArtifactInventory(path);
+  expect(
+    snapshot.occurrences.find(
+      (occurrence) => occurrence.logical_path === "libfoo.so",
+    ),
+  ).toMatchObject({
+    entry_kind: "symlink",
+    artifact_id: null,
+    hash_status: "not-hashed",
+    limitations: expect.arrayContaining([
+      "PyInstaller type code n.",
+      "PyInstaller compression flag 0.",
+      "PyInstaller symlink target was not read.",
+    ]),
+  });
+  expect(
+    snapshot.nodes.find((node) => node.sha256 === sha256(target)),
+  ).toBeUndefined();
+  const directory = await createTestTempDirectory("rea-pyinstaller-out-");
+  const output = join(directory, "extracted");
+  await materializeArtifactInventory(
+    {
+      inputPath: path,
+      inputFormat: "elf",
+      outputRoot: output,
+      environment: process.env,
+      integrityPolicy: "fail",
+    },
+    path,
+    snapshot,
+  );
+  await expect(readFile(join(output, "libfoo.so"))).rejects.toMatchObject({
+    code: "ENOENT",
+  });
+  expect(await readFile(join(output, "data.bin"))).toEqual(payload);
+});
+
 it("retains the file owner after a failed close", async () => {
   const path = await writeArchive(
     "close-owner",
@@ -567,6 +624,43 @@ it("retains the file owner after a failed close", async () => {
   } finally {
     close.mockRestore();
     await reader.close();
+  }
+});
+
+it("retains the descriptor owner when admission cleanup fails", async () => {
+  const directory = await createTestTempDirectory("rea-pyinstaller-admission-");
+  const reader = new PyInstallerArtifactReader(directory);
+  const originalClose = OwnedFileHandle.prototype.close;
+  const owners: OwnedFileHandle[] = [];
+  const closeFailure = new Error("admission close failed");
+  let attempts = 0;
+  const close = vi
+    .spyOn(OwnedFileHandle.prototype, "close")
+    .mockImplementation(async function (this: OwnedFileHandle) {
+      owners.push(this);
+      attempts += 1;
+      if (attempts === 1) throw closeFailure;
+      await originalClose.call(this);
+    });
+  try {
+    await expect(
+      reader.entries()[Symbol.asyncIterator]().next(),
+    ).rejects.toMatchObject({
+      reason: "format",
+      message: `PyInstaller source is not a regular file: ${directory}`,
+      cleanup: {
+        reason: closeFailure.message,
+        resources: [directory],
+      },
+    });
+    expect(owners).toHaveLength(1);
+    await reader.close();
+    expect(attempts).toBe(2);
+    expect(owners[0]).toBe(owners[1]);
+  } finally {
+    close.mockRestore();
+    await reader.close().catch(() => undefined);
+    await owners[0]?.close().catch(() => undefined);
   }
 });
 
