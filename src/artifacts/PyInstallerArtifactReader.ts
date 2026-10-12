@@ -350,7 +350,14 @@ export class PyInstallerArtifactReader implements ArtifactReader {
         "PyInstaller archive is closed",
       );
     const compressed = await readExact(handle, read.absolute, read.size);
-    if (read.compressionFlag === 0) return compressed;
+    if (read.compressionFlag === 0) {
+      if (compressed.length !== read.uncompressedSize)
+        throw new ArtifactReaderFailure(
+          "integrity",
+          "Stored CArchive member size disagrees with its table entry",
+        );
+      return compressed;
+    }
     const inflated = await inflateBounded(compressed, read.uncompressedSize);
     if (!inflated.ok) throw failure(inflated.error);
     if (inflated.value.length !== read.uncompressedSize)
@@ -387,6 +394,15 @@ const assertMemberRanges = (
   entries: readonly CArchiveEntry[],
   tocOffset: number,
 ): void => {
+  for (const entry of entries)
+    if (
+      entry.compressionFlag === 0 &&
+      entry.compressedSize !== entry.uncompressedSize
+    )
+      throw new ArtifactReaderFailure(
+        "integrity",
+        `Stored CArchive member size disagrees with its table entry: ${entry.name}`,
+      );
   const ranges = entries
     .filter((entry) => entry.compressedSize > 0)
     .map((entry) => ({

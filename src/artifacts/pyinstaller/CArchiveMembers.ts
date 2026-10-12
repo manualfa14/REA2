@@ -48,17 +48,25 @@ export const projectStoredMember = (
     pythonMagic !== undefined && isBytecodeType(entry.typeCode)
       ? reconstructedPycHeader(pythonMagic)
       : undefined;
+  const named = canonicalMemberName(entry.name);
   const limitations = memberLimitations(entry.typeCode, entry.compressionFlag);
+  limitations.push(...originalNameLimitation(named.original));
   if (header !== undefined && bytes !== undefined) {
     limitations.push(RECONSTRUCTED_PYTHON_HEADER_LIMITATION);
     limitations.push(`Uncompressed sha256 ${sha256(bytes)}.`);
   }
+  const declaredSize =
+    bytes === undefined ? entry.uncompressedSize : bytes.length;
   return {
     entry: fileEntry({
-      path: entry.name,
-      declaredSize: bytes === undefined ? entry.uncompressedSize : bytes.length,
+      path: named.path,
+      declaredSize,
       compressedSize: entry.compressedSize,
-      byteOffset: archiveStart + entry.offset,
+      byteOffset: sourceByteOffset(
+        archiveStart + entry.offset,
+        declaredSize,
+        entry.compressedSize,
+      ),
       limitations,
       adapterKey: `carchive:${entry.name}`,
     }),
@@ -84,17 +92,24 @@ export const projectPyzContainer = (
   archive: PyzArchive,
   encrypted: boolean,
 ): MaterializedMember => {
+  const named = canonicalMemberName(entry.name);
+  const byteOffset = sourceByteOffset(
+    archiveStart + entry.offset,
+    entry.uncompressedSize,
+    entry.compressedSize,
+  );
+  const limitations = [
+    ...memberLimitations(entry.typeCode, entry.compressionFlag),
+    ...originalNameLimitation(named.original),
+  ];
   if (archive.kind === "opaque")
     return {
       entry: fileEntry({
-        path: entry.name,
+        path: named.path,
         declaredSize: entry.uncompressedSize,
         compressedSize: entry.compressedSize,
-        byteOffset: archiveStart + entry.offset,
-        limitations: [
-          ...memberLimitations(entry.typeCode, entry.compressionFlag),
-          archive.limitation,
-        ],
+        byteOffset,
+        limitations: [...limitations, archive.limitation],
         adapterKey: `carchive:${entry.name}`,
       }),
       bytes: undefined,
@@ -107,17 +122,17 @@ export const projectPyzContainer = (
     };
   return {
     entry: {
-      path: entry.name,
+      path: named.path,
       kind: "directory",
       declaredSize: entry.uncompressedSize,
       compressedSize: entry.compressedSize,
       executable: false,
       encrypted: false,
-      byteOffset: archiveStart + entry.offset,
+      byteOffset,
       declaredSha256: null,
       unpacked: false,
       limitations: [
-        ...memberLimitations(entry.typeCode, entry.compressionFlag),
+        ...limitations,
         `PyInstaller PYZ sha256 ${archive.sha256}.`,
         ...(encrypted
           ? ["PYZ entries are encrypted and were not decoded."]
@@ -138,11 +153,14 @@ export const projectPyzMember = (
   pythonMagic: Buffer | undefined,
   inflated: Buffer | undefined,
 ): MaterializedMember => {
-  const path = pyzPath(container.name, item);
+  const located = pyzMemberLocation(
+    canonicalMemberName(container.name).path,
+    item,
+  );
   if (item.namespace)
     return {
       entry: {
-        path,
+        path: located.path,
         kind: "directory",
         declaredSize: 0,
         compressedSize: 0,
@@ -154,8 +172,9 @@ export const projectPyzMember = (
         limitations: [
           "PyInstaller PYZ type 3.",
           "Namespace package has no bytecode.",
+          ...originalNameLimitation(located.original),
         ],
-        adapterKey: `pyz:${path}`,
+        adapterKey: `pyz:${located.path}`,
       },
       bytes: undefined,
       read: undefined,
@@ -176,7 +195,8 @@ export const projectPyzMember = (
     limitations.push(RECONSTRUCTED_PYTHON_HEADER_LIMITATION);
     limitations.push(`Uncompressed sha256 ${sha256(inflated)}.`);
   }
-  const stored = container.compressionFlag === 0;
+  limitations.push(...originalNameLimitation(located.original));
+  const declaredSize = inflated === undefined ? item.length : inflated.length;
   const body =
     inflated === undefined
       ? undefined
@@ -185,26 +205,80 @@ export const projectPyzMember = (
         : Buffer.concat([header, inflated]);
   return {
     entry: fileEntry({
-      path,
-      declaredSize: inflated === undefined ? item.length : inflated.length,
+      path: located.path,
+      declaredSize,
       compressedSize: item.length,
-      byteOffset: stored ? archiveStart + container.offset + item.offset : null,
+      byteOffset: pyzChildSourceOffset(
+        container,
+        archiveStart,
+        item.offset,
+        declaredSize,
+        item.length,
+      ),
       encrypted,
       limitations,
-      adapterKey: `pyz:${path}`,
+      adapterKey: `pyz:${located.path}`,
     }),
     bytes: body,
     read: undefined,
   };
 };
 
-const pyzPath = (container: string, item: PyzEntry): string => {
+/**
+ * CArchive and PYZ data names treat `\` as a separator. The logical path is
+ * canonical; the stored spelling is kept when that conversion changes it.
+ * `source_location` is an offset plus declared size, so a compressed member
+ * publishes a file span only when that size is the physical extent. Otherwise
+ * the span stays unknown, as ZIP does for compressed entries.
+ */
+const canonicalMemberName = (
+  storedName: string,
+): { readonly path: string; readonly original: string | undefined } => {
+  const path = storedName.replaceAll("\\", "/");
+  return { path, original: path === storedName ? undefined : storedName };
+};
+
+const originalNameLimitation = (original: string | undefined): string[] =>
+  original === undefined
+    ? []
+    : [`Stored PyInstaller member name: ${JSON.stringify(original)}.`];
+
+const sourceByteOffset = (
+  absoluteOffset: number,
+  declaredSize: number,
+  physicalLength: number,
+): number | null => (declaredSize === physicalLength ? absoluteOffset : null);
+
+const pyzChildSourceOffset = (
+  container: CArchiveEntry,
+  archiveStart: number,
+  itemOffset: number,
+  declaredSize: number,
+  physicalLength: number,
+): number | null =>
+  container.compressionFlag === 0
+    ? sourceByteOffset(
+        archiveStart + container.offset + itemOffset,
+        declaredSize,
+        physicalLength,
+      )
+    : null;
+
+const pyzMemberLocation = (
+  container: string,
+  item: PyzEntry,
+): { readonly path: string; readonly original: string | undefined } => {
   // Type 2 names are resource paths, not dotted module names.
-  if (item.typeCode === 2) return `${container}/${item.name}`;
+  if (item.typeCode === 2) {
+    const named = canonicalMemberName(item.name);
+    return { path: `${container}/${named.path}`, original: named.original };
+  }
   const dotted = item.name.replaceAll(".", "/");
-  if (item.namespace) return `${container}/${dotted}`;
-  if (item.package) return `${container}/${dotted}/__init__.pyc`;
-  return `${container}/${dotted}.pyc`;
+  if (item.namespace)
+    return { path: `${container}/${dotted}`, original: undefined };
+  if (item.package)
+    return { path: `${container}/${dotted}/__init__.pyc`, original: undefined };
+  return { path: `${container}/${dotted}.pyc`, original: undefined };
 };
 
 const isBytecodeType = (typeCode: string): boolean =>

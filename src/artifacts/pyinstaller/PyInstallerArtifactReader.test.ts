@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { expect, it, vi } from "vitest";
@@ -567,5 +567,136 @@ it("retains the file owner after a failed close", async () => {
   } finally {
     close.mockRestore();
     await reader.close();
+  }
+});
+
+it("inventories and extracts a Windows member name under its canonical path", async () => {
+  const storedName = String.raw`pkg\data.bin`;
+  const pyzName = String.raw`res\icon.bin`;
+  const payload = Buffer.from("nested-bytes");
+  const icon = Buffer.from("icon-bytes");
+  const path = await writeArchive(
+    "windows",
+    cArchiveExecutable({
+      layout: "2.1",
+      pythonVersion: 309,
+      pythonLibrary: "python39.dll",
+      members: [
+        { name: storedName, typeCode: "x", payload, compress: false },
+        {
+          name: "PYZ.pyz",
+          typeCode: "z",
+          payload: pyzArchive({
+            magic: PYTHON_39_MAGIC,
+            modules: [{ name: pyzName, typeCode: 2, body: icon }],
+          }),
+          compress: false,
+        },
+      ],
+    }),
+  );
+  const snapshot = await scanCanonicalArtifactInventory(path);
+  const member = snapshot.occurrences.find(
+    (occurrence) => occurrence.logical_path === "pkg/data.bin",
+  );
+  const resource = snapshot.occurrences.find(
+    (occurrence) => occurrence.logical_path === "PYZ.pyz/res/icon.bin",
+  );
+  expect(member?.limitations).toContain(
+    `Stored PyInstaller member name: ${JSON.stringify(storedName)}.`,
+  );
+  expect(resource?.limitations).toContain(
+    `Stored PyInstaller member name: ${JSON.stringify(pyzName)}.`,
+  );
+  const directory = await createTestTempDirectory("rea-pyinstaller-out-");
+  const output = join(directory, "extracted");
+  await materializeArtifactInventory(
+    {
+      inputPath: path,
+      inputFormat: "elf",
+      outputRoot: output,
+      environment: process.env,
+      integrityPolicy: "fail",
+    },
+    path,
+    snapshot,
+  );
+  expect(await readFile(join(output, "pkg", "data.bin"))).toEqual(payload);
+  expect(await readFile(join(output, "PYZ.pyz", "res", "icon.bin"))).toEqual(
+    icon,
+  );
+});
+
+it("rejects a stored member whose declared size disagrees with its bytes", async () => {
+  const path = await writeArchive(
+    "stored-size",
+    cArchiveExecutable({
+      layout: "2.1",
+      pythonVersion: 309,
+      pythonLibrary: "python39.dll",
+      members: [
+        {
+          name: "data.bin",
+          typeCode: "x",
+          payload: Buffer.from("abcd"),
+          compress: false,
+          declaredUncompressedSize: 0,
+        },
+      ],
+    }),
+  );
+  await expect(scanCanonicalArtifactInventory(path)).rejects.toMatchObject({
+    reason: "integrity",
+    message: expect.stringContaining(
+      "Stored CArchive member size disagrees with its table entry",
+    ),
+  });
+});
+
+it("keeps compressed member spans on the physical extent or unknown", async () => {
+  const payload = Buffer.alloc(10_000, 0x61);
+  const path = await writeArchive(
+    "compressed-span",
+    cArchiveExecutable({
+      layout: "2.1",
+      pythonVersion: 309,
+      pythonLibrary: "python39.dll",
+      members: [
+        { name: "payload.bin", typeCode: "x", payload, compress: true },
+        {
+          name: "PYZ.pyz",
+          typeCode: "z",
+          payload: pyzArchive({
+            magic: PYTHON_39_MAGIC,
+            modules: [{ name: "app", typeCode: 0, body: payload }],
+          }),
+          compress: false,
+        },
+      ],
+    }),
+  );
+  const snapshot = await scanCanonicalArtifactInventory(path);
+  const fileSize = (await stat(path)).size;
+  expect(fileSize).toBeLessThan(payload.length);
+  for (const logicalPath of ["payload.bin", "PYZ.pyz/app.pyc"]) {
+    const occurrence = snapshot.occurrences.find(
+      (candidate) => candidate.logical_path === logicalPath,
+    );
+    expect(occurrence?.declared_size).toBeGreaterThan(fileSize);
+    expect(occurrence?.compressed_size ?? fileSize).toBeLessThan(
+      occurrence?.declared_size ?? 0,
+    );
+    const span = occurrence?.source_location;
+    if (span === null || span === undefined) {
+      expect(span).toBeNull();
+      continue;
+    }
+    expect(span.length).toBe(occurrence?.compressed_size);
+    expect(span.offset + span.length).toBeLessThanOrEqual(fileSize);
+  }
+  for (const occurrence of snapshot.occurrences) {
+    const span = occurrence.source_location;
+    if (span === null) continue;
+    expect(span.offset + span.length).toBeLessThanOrEqual(fileSize);
   }
 });
