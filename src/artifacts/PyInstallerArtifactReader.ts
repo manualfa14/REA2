@@ -262,7 +262,7 @@ export class PyInstallerArtifactReader implements ArtifactReader {
             image.bytes,
             item,
             encrypted,
-            magic,
+            image.archive.pythonMagic,
             signal,
           ),
         );

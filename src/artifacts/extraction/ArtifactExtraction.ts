@@ -20,8 +20,7 @@ import { ZipArtifactReader } from "../ZipArtifactReader.js";
 import { MachOSliceArtifactReader } from "../MachOSliceArtifactReader.js";
 import { PyInstallerArtifactReader } from "../PyInstallerArtifactReader.js";
 import { containsPyInstallerArchive } from "../pyinstaller/CArchiveLayout.js";
-import { OwnedFileHandle } from "../../filesystem/OwnedFileHandle.js";
-import { openRegularFile } from "../../filesystem/RegularFile.js";
+import { openRootArtifact } from "../inventory/hashStableRootArtifact.js";
 import {
   artifactExtractionResultSchema,
   type ArtifactExtractionResult,
@@ -418,7 +417,10 @@ const isZipFormat = (
  */
 const requireExtractableFormat = async (
   path: string,
-  input: Pick<ArtifactExtractionInput, "inputPath" | "inputFormat">,
+  input: Pick<
+    ArtifactExtractionInput,
+    "inputPath" | "inputFormat" | "resourceScope"
+  >,
 ): Promise<boolean> => {
   const format = input.inputFormat;
   const directory = (await lstat(path)).isDirectory();
@@ -429,7 +431,7 @@ const requireExtractableFormat = async (
     !isZipFormat(format) &&
     !(
       (format === "elf" || format === "pe") &&
-      (await pathContainsPyInstallerArchive(path))
+      (await pathContainsPyInstallerArchive(path, input.resourceScope))
     )
   )
     throw new AnalysisUnsupportedTargetError(
@@ -444,7 +446,7 @@ const createReader = async (
   path: string,
   input: Pick<
     ArtifactExtractionInput,
-    "inputPath" | "inputFormat" | "environment"
+    "inputPath" | "inputFormat" | "environment" | "resourceScope"
   >,
 ): Promise<ArtifactReader> => {
   const format = input.inputFormat;
@@ -454,7 +456,7 @@ const createReader = async (
   if (isZipFormat(format)) return new ZipArtifactReader(path, format);
   if (
     (format === "elf" || format === "pe" || isMachOFormat(format)) &&
-    (await pathContainsPyInstallerArchive(path))
+    (await pathContainsPyInstallerArchive(path, input.resourceScope))
   )
     return new PyInstallerArtifactReader(path);
   return new MachOSliceArtifactReader(path, input.environment);
@@ -462,14 +464,36 @@ const createReader = async (
 
 const pathContainsPyInstallerArchive = async (
   path: string,
+  resourceScope: ArtifactResourceScope,
 ): Promise<boolean> => {
-  const handle = await openRegularFile(path, { symlinks: "reject" });
-  const owner = new OwnedFileHandle(handle);
+  const owner = await openRootArtifact(path, resourceScope);
+  const resource = `PyInstaller detection descriptor for ${path}`;
+  let detected: boolean;
   try {
-    return await containsPyInstallerArchive(handle, (await handle.stat()).size);
-  } finally {
-    await owner.close();
+    detected = await containsPyInstallerArchive(
+      owner.handle,
+      (await owner.handle.stat()).size,
+    );
+  } catch (cause: unknown) {
+    // Keep the detection failure primary; a failed close stays retained.
+    await resourceScope.release({
+      kind: "file-handle",
+      resource,
+      handle: owner,
+    });
+    throw cause;
   }
+  const cleanup = await resourceScope.release({
+    kind: "file-handle",
+    resource,
+    handle: owner,
+  });
+  if (cleanup.kind === "failed")
+    throw ArtifactReaderFailure.withCleanup(
+      cleanup.cause,
+      ArtifactReaderFailure.cleanupObservation(cleanup.cause, resource),
+    );
+  return detected;
 };
 
 const preflight = (entry: ArtifactEntry): void => {

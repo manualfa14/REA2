@@ -794,3 +794,53 @@ it("keeps compressed member spans on the physical extent or unknown", async () =
     expect(span.offset + span.length).toBeLessThanOrEqual(fileSize);
   }
 });
+
+it("reconstructs each PYZ image's bytecode with that image's own magic", async () => {
+  const python314Magic = Buffer.from("2b0e0d0a", "hex");
+  const first = Buffer.from("first-module");
+  const second = Buffer.from("second-module");
+  const path = await writeArchive(
+    "two-pyz",
+    cArchiveExecutable({
+      layout: "2.1",
+      pythonVersion: 314,
+      pythonLibrary: "libpython3.14.dylib",
+      members: [
+        {
+          name: "PYZ.pyz",
+          typeCode: "z",
+          compress: false,
+          payload: pyzArchive({
+            magic: PYTHON_39_MAGIC,
+            modules: [{ name: "first", typeCode: 0, body: first }],
+          }),
+        },
+        {
+          name: "second.pyz",
+          typeCode: "z",
+          compress: false,
+          payload: pyzArchive({
+            magic: python314Magic,
+            modules: [{ name: "second", typeCode: 0, body: second }],
+          }),
+        },
+      ],
+    }),
+  );
+  const snapshot = await scanCanonicalArtifactInventory(path);
+  const withHeader = (magic: Buffer, body: Buffer): Buffer =>
+    Buffer.concat([reconstructedPycHeader(magic), body]);
+  const firstBytes = withHeader(PYTHON_39_MAGIC, first);
+  const secondBytes = withHeader(python314Magic, second);
+  expect(
+    snapshot.nodes.find((node) => node.sha256 === sha256(firstBytes)),
+  ).toMatchObject({ size: firstBytes.length });
+  expect(
+    snapshot.nodes.find((node) => node.sha256 === sha256(secondBytes)),
+  ).toMatchObject({ size: secondBytes.length });
+  expect(
+    snapshot.nodes.find(
+      (node) => node.sha256 === sha256(withHeader(PYTHON_39_MAGIC, second)),
+    ),
+  ).toBeUndefined();
+});
