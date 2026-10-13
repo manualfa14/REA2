@@ -1,18 +1,17 @@
+import { readFileHandlePrefix } from "../filesystem/readFileHandlePrefix.js";
 import { constants, type Stats } from "node:fs";
 import { createHash } from "node:crypto";
 import {
-  access,
-  lstat,
-  realpath,
-  stat,
-  type FileHandle,
-} from "node:fs/promises";
+  nesContainerFormat,
+  parseInesLayout,
+} from "../domain/inesContainer.js";
+import { access, realpath, stat, type FileHandle } from "node:fs/promises";
 import { extname, isAbsolute, resolve } from "node:path";
 
 import { BinaryTargetError } from "../domain/configurationErrors.js";
 import {
   openRegularFile,
-  sameRegularFileState,
+  verifyRegularFileState,
 } from "../filesystem/RegularFile.js";
 import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
@@ -160,9 +159,16 @@ export const parseBinaryTarget = async (
           availableArchitectures: ["x86"],
         });
       }
+      // Explicit database selection owns routing; a suffix is only a fallback.
+      const artifactFormat =
+        targetKind === "database"
+          ? undefined
+          : await detectArtifactFormat(path, handle, metadata, signal);
       if (
         targetKind === "database" ||
-        (targetKind === undefined && path.toLowerCase().endsWith(".hop"))
+        (targetKind === undefined &&
+          artifactFormat === undefined &&
+          path.toLowerCase().endsWith(".hop"))
       )
         return ok({
           path,
@@ -171,7 +177,6 @@ export const parseBinaryTarget = async (
           kind: "database",
           format: "analysis-database",
         });
-      const artifactFormat = await detectArtifactFormat(path, handle, signal);
       if (artifactFormat !== undefined) {
         const identity = {
           path,
@@ -257,9 +262,26 @@ const throwIfTargetResolutionCancelled = (signal?: AbortSignal): void => {
     throw new AnalysisCancelledError("resolve_binary_target");
 };
 
+/** Preserve cancellation when an asynchronous identity check succeeds or rejects. */
+const verifyTargetState = async (
+  path: string,
+  handle: FileHandle,
+  initial: Stats,
+  signal?: AbortSignal,
+): Promise<void> => {
+  try {
+    await verifyRegularFileState(path, { handle, initial });
+  } catch (cause: unknown) {
+    throwIfTargetResolutionCancelled(signal);
+    throw cause;
+  }
+  throwIfTargetResolutionCancelled(signal);
+};
+
 const detectArtifactFormat = async (
   path: string,
   handle: FileHandle,
+  initial: Stats,
   signal?: AbortSignal,
 ): Promise<
   | Exclude<
@@ -277,32 +299,44 @@ const detectArtifactFormat = async (
 > => {
   throwIfTargetResolutionCancelled(signal);
   const lower = path.toLowerCase();
-  const magic = Buffer.alloc(8);
-  const observed = await handle.read(magic, 0, magic.length, 0);
+  const magic = await readFileHandlePrefix(handle, 16, () =>
+    throwIfTargetResolutionCancelled(signal),
+  );
   throwIfTargetResolutionCancelled(signal);
+  await verifyTargetState(path, handle, initial, signal);
   if (
-    observed.bytesRead === 8 &&
-    magic.equals(Buffer.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]))
+    magic.length >= 8 &&
+    magic.subarray(0, 8).equals(Buffer.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]))
   )
     throw new BinaryTargetError(
       path,
       "WebAssembly v1 artifacts are not supported by the native opening route",
       { constraint: "wasm_requires_static_inspection" },
     );
-  if (hasZipSignature(magic.subarray(0, observed.bytesRead))) {
+  const prefix = magic;
+  const nesFormat = nesContainerFormat(prefix);
+  if (nesFormat !== undefined) {
+    const parsed = parseInesLayout(prefix, initial.size);
+    throwIfTargetResolutionCancelled(signal);
+    if (!parsed.ok)
+      throw new BinaryTargetError(path, parsed.error, {
+        constraint: "file_format_rejected",
+      });
+    return "ines";
+  }
+  if (hasZipSignature(prefix)) {
     // The HarmonyOS App Pack suffix `.app` is a root-input concept; a nested
     // ZIP member ending in `.app` keeps the generic zip classification.
     if (lower.endsWith(".app")) return "app-pack";
     return zipPackageFormatForPath(lower) ?? "zip";
   }
   // Binary plists, including keyed archives, often use other extensions.
-  if (hasBinaryPlistSignature(magic.subarray(0, observed.bytesRead)))
-    return "plist";
+  if (hasBinaryPlistSignature(magic)) return "plist";
   const named = namedArtifactFormat(lower);
   if (named !== undefined) return named;
   if (
     lower.endsWith(".pkg") &&
-    observed.bytesRead >= 4 &&
+    magic.length >= 4 &&
     magic.subarray(0, 4).equals(Buffer.from("xar!"))
   )
     return "pkg";
@@ -343,7 +377,7 @@ const isArchiveFormat = (
     | "raw-binary"
   >,
 ): format is Extract<BinaryTarget, { kind: "archive" }>["format"] =>
-  isZipPackageFormat(format) || ["asar", "dmg", "pkg"].includes(format);
+  isZipPackageFormat(format) || ["asar", "ines", "dmg", "pkg"].includes(format);
 
 const sha256Handle = async (
   handle: FileHandle,
@@ -370,12 +404,8 @@ const sha256Handle = async (
       throw new BinaryTargetError(path, "target grew while being read");
   }
   throwIfTargetResolutionCancelled(signal);
-  const [opened, currentPath] = await Promise.all([handle.stat(), lstat(path)]);
-  if (
-    !sameRegularFileState(initial, opened) ||
-    !sameRegularFileState(initial, currentPath) ||
-    position !== initial.size
-  )
+  await verifyTargetState(path, handle, initial, signal);
+  if (position !== initial.size)
     throw new BinaryTargetError(path, "target changed while being read");
   return hash.digest("hex");
 };

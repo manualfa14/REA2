@@ -412,6 +412,12 @@ jobs:
           npm run verify:legacy-simulator
           npm run verify:apple-dispatch
           npm run verify:interface-builder
+      - name: Verify portable iNES CLI, MCP and source boundaries
+        run: >-
+          npm run test:focused --
+          tests/acceptance/inesContainer.test.ts
+          tests/boundary/filesystem/inesArtifact.test.ts
+          tests/boundary/filesystem/inesCancellation.test.ts
       - name: Run native Apple and process boundary regressions
         run: >-
           npm run test:focused --

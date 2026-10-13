@@ -17,7 +17,12 @@ const artifactIdSchema = prefixedDigestSchema("art");
 
 const inspectionObservationSchema = z.strictObject({
   observation_id: prefixedDigestSchema("aio"),
-  kind: z.enum(["root-manifest", "integrity"]),
+  kind: z.enum([
+    "root-manifest",
+    "integrity",
+    "container-header",
+    "reconstruction",
+  ]),
   subject: textSchema,
   value: jsonValueSchema,
   evidence_id: evidenceIdSchema,
@@ -115,7 +120,8 @@ export const artifactInspectionOutputSchema =
       .array(
         artifactInspectionResultSchema.shape.substeps.element.safeExtend({
           evidence: evidenceSchema.safeExtend({
-            normalized_result: artifactInventoryOutputSchema,
+            normalized_result:
+              artifactInventoryOutputSchema.and(jsonValueSchema),
           }),
         }),
       )
@@ -228,6 +234,22 @@ const allObservations = (
   ...inventory.integrity_contradictions.map((value) =>
     observation("integrity", value.contradiction_id, value, evidenceId),
   ),
+  ...(inventory.ines === undefined
+    ? []
+    : [
+        observation(
+          "container-header",
+          inventory.manifest.root_artifact_id,
+          inventory.ines.header,
+          evidenceId,
+        ),
+        observation(
+          "reconstruction",
+          inventory.manifest.root_artifact_id,
+          inventory.ines.reconstruction,
+          evidenceId,
+        ),
+      ]),
 ];
 
 const observation = (

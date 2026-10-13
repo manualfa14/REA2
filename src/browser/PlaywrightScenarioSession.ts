@@ -14,7 +14,10 @@ import { performPlaywrightScenarioAction } from "./PlaywrightScenarioActions.js"
 import { capturePlaywrightStepArtifacts } from "./PlaywrightScenarioArtifacts.js";
 import { PlaywrightScenarioEvents } from "./PlaywrightScenarioEvents.js";
 import { PlaywrightScenarioStorage } from "./PlaywrightScenarioStorage.js";
-import { withPlaywrightExecutionBoundary } from "./PlaywrightExecutionBoundary.js";
+import {
+  PLAYWRIGHT_SCENARIO_CLEANUP_TIMEOUT_MS,
+  withPlaywrightExecutionBoundary,
+} from "./PlaywrightExecutionBoundary.js";
 import {
   browserScenarioCaptureData,
   browserScenarioOperationFailure,
@@ -154,7 +157,10 @@ export class PlaywrightScenarioSession implements BrowserScenarioSessionPort {
           () => undefined,
         );
       options.retainCleanup?.(() =>
-        withPlaywrightExecutionBoundary(lateCleanup, 1_000),
+        withPlaywrightExecutionBoundary(
+          lateCleanup,
+          PLAYWRIGHT_SCENARIO_CLEANUP_TIMEOUT_MS,
+        ),
       );
       void lateCleanup().catch((cleanupCause: unknown) => {
         // best-effort cleanup: retainCleanup keeps the retry capability.
