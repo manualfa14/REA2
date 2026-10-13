@@ -31,6 +31,35 @@ import { javaClassFile } from "../../../tests/fixtures/javaClassFile.js";
 const read = (bytes: Uint8Array) =>
   readMachoImage(readerOf(bytes), bytes.length);
 
+it("preserves leading U+FEFF in load-command strings", async () => {
+  const name = "\ufeff@rpath/libcore.dylib";
+  const rpath = "\ufeff@loader_path/Frameworks";
+  const environment = "\ufeffDYLD_FRAMEWORK_PATH=@executable_path";
+  const facts = await read(
+    machoImage({
+      fileType: FILE_TYPE.dylib,
+      commands: [
+        dylibCommand(LC.ID_DYLIB, name),
+        dylibCommand(LC.LOAD_DYLIB, name),
+        dylibUseCommand(LC.LOAD_DYLIB, name, 0x1),
+        rpathCommand(rpath),
+        dyldEnvironmentCommand(environment),
+      ],
+    }),
+  );
+  expect(facts).toMatchObject({
+    status: "parsed",
+    slices: [
+      {
+        install_name: name,
+        dependencies: [{ install_name: name }, { install_name: name }],
+        rpaths: [rpath],
+        dyld_environment: [environment],
+      },
+    ],
+  });
+});
+
 // Legacy `LC_VERSION_MIN_*` commands carry no simulator flag: per dyld
 // rules Intel images are simulator, ARM images are device (tvOS simulator
 // is x86_64 only). A legacy simulator executable must not fail resolution

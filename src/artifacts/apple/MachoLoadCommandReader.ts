@@ -456,7 +456,8 @@ const commandString = (
       `load command ${index} has an unterminated string`,
     );
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(
+    // lc_str holds literal filename/environment bytes, not a BOM-marked document.
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
       body.subarray(offset, end),
     );
   } catch {

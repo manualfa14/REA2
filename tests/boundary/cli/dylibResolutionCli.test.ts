@@ -104,6 +104,52 @@ const withBrokenHelper = async (app: string): Promise<void> => {
   await writeFiles(app, { "Contents/Helpers/broken": broken });
 };
 
+cliTest(
+  "does not turn a leading U+FEFF into an rpath load",
+  async ({ cli }) => {
+    const app = await fixtureApp();
+    const name = "\ufeff@rpath/libcore.dylib";
+    await writeFiles(app, {
+      "Contents/MacOS/App": machoImage({
+        commands: [
+          buildVersionCommand(1),
+          rpathCommand("@executable_path/../Frameworks"),
+          dylibCommand(LC.LOAD_DYLIB, name),
+          dylibCommand(LC.LOAD_DYLIB, "@rpath/libcore.dylib"),
+        ],
+      }),
+    });
+    const result = await cli.run({
+      arguments: [
+        "trace-dylib-resolution",
+        app,
+        "--root",
+        "Contents/MacOS/App",
+        "--json",
+      ],
+      environment: ENVIRONMENT,
+    });
+    expect(result.exitCode, JSON.stringify(result.json)).toBe(0);
+    const trace = dylibResolutionResultSchema.parse(
+      (result.json as { normalized_result: unknown }).normalized_result,
+    );
+    expect(
+      trace.edges.map(({ install_name, resolution }) => ({
+        install_name,
+        status: resolution.status,
+        image: resolution.image,
+      })),
+    ).toEqual([
+      { install_name: name, status: "undetermined", image: null },
+      {
+        install_name: "@rpath/libcore.dylib",
+        status: "resolved",
+        image: "Contents/Frameworks/libcore.dylib",
+      },
+    ]);
+  },
+);
+
 describe("trace-dylib-resolution CLI", () => {
   cliTest("traces every executable root of an app bundle", async ({ cli }) => {
     const app = await fixtureApp();
