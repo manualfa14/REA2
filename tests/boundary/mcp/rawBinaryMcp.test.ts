@@ -50,29 +50,35 @@ const structured = (result: CallToolResult): Record<string, unknown> => {
   return z.record(z.string(), z.unknown()).parse(result.structuredContent);
 };
 
-it("opens a headerless image when architecture and entry are supplied", async () => {
-  const root = await createTestTempDirectory("rea-raw-mcp-");
-  const path = join(root, "ecu.bin");
-  await writeFile(path, Buffer.from("1eff2fe1", "hex"));
-  const { client } = await connect();
-  const opened = await client.callTool({
-    name: "open_binary",
-    arguments: {
+it.each([
+  ["arm", "0x08000000", "0x8000000", "1eff2fe1"],
+  ["6502", "0x008001", "0x8001", "a92a60"],
+])(
+  "opens a headerless %s image when architecture and entry are supplied",
+  async (architecture, entryPoint, canonical, bytes) => {
+    const root = await createTestTempDirectory("rea-raw-mcp-");
+    const path = join(root, "ecu.bin");
+    await writeFile(path, Buffer.from(bytes, "hex"));
+    const { client } = await connect();
+    const opened = await client.callTool({
+      name: "open_binary",
+      arguments: {
+        path,
+        format: "raw-binary",
+        architecture,
+        entry_point: entryPoint,
+      },
+    });
+    expect(opened.isError).not.toBe(true);
+    expect(structured(opened).result).toMatchObject({
       path,
       format: "raw-binary",
-      architecture: "arm",
-      entry_point: "0x08000000",
-    },
-  });
-  expect(opened.isError).not.toBe(true);
-  expect(structured(opened).result).toMatchObject({
-    path,
-    format: "raw-binary",
-    kind: "executable",
-    architecture: "arm",
-    entry_point: "0x8000000",
-  });
-});
+      kind: "executable",
+      architecture,
+      entry_point: canonical,
+    });
+  },
+);
 
 it("rejects an unaligned AArch64 entry before selecting or starting a provider", async () => {
   const root = await createTestTempDirectory("rea-raw-mcp-alignment-");
