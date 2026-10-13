@@ -1,5 +1,5 @@
 import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
-import { dirname, join } from "node:path";
+import { posix, win32 } from "node:path";
 import { execFileOutput } from "../process/ExecFileOutput.js";
 
 /** Launch coordinates obtained from Ghidra's own release configuration helper. */
@@ -19,15 +19,21 @@ export const ghidraJavaLaunch = async (options: {
   readonly arguments: readonly string[];
   readonly environment: NodeJS.ProcessEnv;
 }> => {
-  const supportRoot = dirname(options.analyzeHeadlessPath);
-  const installRoot = dirname(supportRoot);
-  const command = join(options.javaHome, "bin", "java");
+  const paths = options.platform === "win32" ? win32 : posix;
+  const supportRoot = paths.dirname(options.analyzeHeadlessPath);
+  const installRoot = paths.dirname(supportRoot);
+  const command = paths.join(
+    options.javaHome,
+    "bin",
+    options.platform === "win32" ? "java.exe" : "java",
+  );
   const isolatedProperties = [
     `-Duser.home=${options.homeRoot}`,
     `-Djava.io.tmpdir=${options.tempRoot}`,
   ];
   const supportArguments = [
     ...isolatedProperties,
+    ...(options.platform === "win32" ? ["-XX:-UsePerfData"] : []),
     // Only identified HotSpot VMs have these unified-logging semantics. OpenJ9
     // uses different -Xlog behavior; missing VM identity must stay unknown.
     ...(/^(?:OpenJDK|Java HotSpot\(TM\)) (?:64-Bit )?(?:Server|Client|Zero) VM$/u.test(
@@ -36,7 +42,7 @@ export const ghidraJavaLaunch = async (options: {
       ? ["-Xlog:disable", "-Xlog:all=warning:stderr"]
       : []),
     "-cp",
-    join(supportRoot, "LaunchSupport.jar"),
+    paths.join(supportRoot, "LaunchSupport.jar"),
     "LaunchSupport",
     installRoot,
   ];
@@ -94,9 +100,17 @@ export const ghidraJavaLaunch = async (options: {
       "-XX:CICompilerCount=2",
       "-Djava.awt.headless=true",
       ...isolatedProperties,
+      ...(options.platform === "win32" ? ["-XX:-UsePerfData"] : []),
       "-showversion",
       "-cp",
-      join(installRoot, "Ghidra", "Framework", "Utility", "lib", "Utility.jar"),
+      paths.join(
+        installRoot,
+        "Ghidra",
+        "Framework",
+        "Utility",
+        "lib",
+        "Utility.jar",
+      ),
       "ghidra.Ghidra",
       "ghidra.app.util.headless.AnalyzeHeadless",
       ...options.arguments,

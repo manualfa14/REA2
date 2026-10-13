@@ -11,12 +11,6 @@ import { basename, dirname, join, posix, win32 } from "node:path";
 import writeFileAtomic from "write-file-atomic";
 
 import { windowsPrivateRuntime } from "../windows/WindowsPrivateRuntime.js";
-import {
-  quoteWindowsBatchToken,
-  windowsBatchCommand,
-  WindowsBatchCommandError,
-} from "../process/WindowsBatchCommand.js";
-
 import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import { err, ok, type Result } from "../domain/result.js";
 import type { AnalysisCapturedOutput } from "../domain/analysisErrorBase.js";
@@ -150,7 +144,6 @@ export interface GhidraHeadlessLauncherOptions {
   readonly javaVmName?: string;
   readonly bridgeScriptPath: string;
   readonly platform?: NodeJS.Platform;
-  readonly comSpec?: string;
   /** Select the admitted 16-bit real-mode MZ import instead of auto-detection. */
   readonly dosMz?: true;
   readonly dosCom?: true;
@@ -278,71 +271,54 @@ export class GhidraHeadlessLauncher implements GhidraLauncher {
           ? {}
           : { disabledAnalyzers: this.options.disabledAnalyzers }),
       });
-      const scriptCommand = ghidraHeadlessCommand({
-        environment: this.options.environment,
-        platform,
-        analyzeHeadlessPath: this.options.analyzeHeadlessPath,
-        arguments: headlessArguments,
-        ...(this.options.comSpec === undefined
-          ? {}
-          : { comSpec: this.options.comSpec }),
-      });
       const environment = ghidraLaunchEnvironment(
         paths,
         this.options.javaHome,
         platform,
-        scriptCommand.command,
         this.options.environment,
       );
-      if (platform !== "win32" && this.options.javaHome === undefined)
-        throw new GhidraLaunchError(
-          "POSIX Ghidra requires its inspected JDK home",
-        );
-      const command =
-        platform !== "win32" && this.options.javaHome !== undefined
-          ? await ghidraJavaLaunch({
-              platform,
-              analyzeHeadlessPath: this.options.analyzeHeadlessPath,
-              javaHome: this.options.javaHome,
-              ...(this.options.javaVmName === undefined
-                ? {}
-                : { javaVmName: this.options.javaVmName }),
-              homeRoot: paths.homeRoot,
-              tempRoot: paths.tempRoot,
-              arguments: headlessArguments,
-              environment,
-              onStderr: (mode, stderr) => {
-                if (stderr === "") return;
-                const bytes = Buffer.byteLength(stderr);
-                const redacted = redactCapturedTransportCredential(
-                  { text: stderr, bytes, observedBytes: bytes },
-                  session.token,
-                  "[REDACTED]",
-                );
-                const bounded = boundedUtf8Text(
-                  redacted,
-                  GHIDRA_LAUNCH_COMMAND_OUTPUT_BYTES,
-                );
-                launchSupport.push({
-                  mode,
-                  stderr: bounded.text,
-                  stderr_bytes: bytes,
-                  stderr_truncated: bounded.truncated,
-                });
-              },
-              ...(options.signal === undefined
-                ? {}
-                : { signal: options.signal }),
-            })
-          : { ...scriptCommand, environment };
+      if (this.options.javaHome === undefined)
+        throw new GhidraLaunchError("Ghidra requires its inspected JDK home");
+      // The official batch wrapper reparses caller paths through cmd.exe.
+      // Read its release configuration with LaunchSupport, then pass JVM and
+      // analysis arguments directly on every host so paths stay literal data.
+      const command = await ghidraJavaLaunch({
+        platform,
+        analyzeHeadlessPath: this.options.analyzeHeadlessPath,
+        javaHome: this.options.javaHome,
+        ...(this.options.javaVmName === undefined
+          ? {}
+          : { javaVmName: this.options.javaVmName }),
+        homeRoot: paths.homeRoot,
+        tempRoot: paths.tempRoot,
+        arguments: headlessArguments,
+        environment,
+        onStderr: (mode, stderr) => {
+          if (stderr === "") return;
+          const bytes = Buffer.byteLength(stderr);
+          const redacted = redactCapturedTransportCredential(
+            { text: stderr, bytes, observedBytes: bytes },
+            session.token,
+            "[REDACTED]",
+          );
+          const bounded = boundedUtf8Text(
+            redacted,
+            GHIDRA_LAUNCH_COMMAND_OUTPUT_BYTES,
+          );
+          launchSupport.push({
+            mode,
+            stderr: bounded.text,
+            stderr_bytes: bytes,
+            stderr_truncated: bounded.truncated,
+          });
+        },
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      });
       started = await (this.options.spawnProcess ?? spawnOwnedProviderProcess)({
         command: command.command,
         arguments: command.arguments,
         runId: session.runId,
-        // POSIX launches the inspected JVM directly; script wrappers cannot
-        // preserve JVM property paths containing spaces as single arguments.
-        expectedCommand: platform !== "win32" ? command.command : null,
-        windowsVerbatimArguments: platform === "win32",
+        expectedCommand: command.command,
         platform,
         env: command.environment,
         hostEnvironment: {},
@@ -456,55 +432,6 @@ const ownedGhidraProcess = (
   ownership: spawned.ownership,
   cleanup: () => cleanupStartedProcess(spawned, platform),
 });
-
-/** Exact executable and argv passed to shell-free process creation. */
-export interface GhidraHeadlessCommand {
-  readonly command: string;
-  readonly arguments: readonly string[];
-}
-
-/** Build a direct POSIX launch or a conservatively quoted Windows batch call. */
-export const ghidraHeadlessCommand = (options: {
-  readonly environment: Readonly<NodeJS.ProcessEnv>;
-  readonly platform: NodeJS.Platform;
-  readonly analyzeHeadlessPath: string;
-  readonly arguments: readonly string[];
-  readonly comSpec?: string;
-}): GhidraHeadlessCommand => {
-  if (options.platform !== "win32")
-    return {
-      command: options.analyzeHeadlessPath,
-      arguments: [...options.arguments],
-    };
-  const command = ghidraBatchStep(() =>
-    windowsBatchCommand({
-      environment: options.environment,
-      batchPath: options.analyzeHeadlessPath,
-      arguments: options.arguments,
-      ...(options.comSpec === undefined ? {} : { comSpec: options.comSpec }),
-    }),
-  );
-  if ((command.arguments.at(-1)?.length ?? 0) > 30_000)
-    throw new GhidraLaunchError(
-      "Windows Ghidra command exceeds the P0 length limit",
-    );
-  return command;
-};
-
-/** Keep Ghidra's launch error type and P0 wording for shared batch checks. */
-const ghidraBatchStep = <T>(step: () => T): T => {
-  try {
-    return step();
-  } catch (cause: unknown) {
-    if (!(cause instanceof WindowsBatchCommandError)) throw cause;
-    throw new GhidraLaunchError(
-      cause.reason === "metacharacter"
-        ? "Windows Ghidra P0 paths cannot contain command-interpreter metacharacters"
-        : cause.message,
-      { cause },
-    );
-  }
-};
 
 const cleanupStartedProcess = (
   started: SpawnedOwnedProviderProcess,
@@ -766,19 +693,15 @@ const ghidraLaunchEnvironment = (
   paths: ReturnType<typeof ghidraRuntimePaths>,
   javaHome: string | undefined,
   platform: NodeJS.Platform,
-  executable: string,
   selectedEnvironment: Readonly<NodeJS.ProcessEnv>,
 ): NodeJS.ProcessEnv => {
   return {
     ...ghidraJavaEnvironment(javaHome, selectedEnvironment, platform),
-    ...ghidraHeadlessJavaOptions(paths.homeRoot, paths.tempRoot, platform),
+    GHIDRA_HEADLESS_JAVA_OPTIONS: "",
     HOME: paths.homeRoot,
     TMPDIR: paths.tempRoot,
     ...(platform === "win32"
       ? {
-          // Batch FOR /F launches another command interpreter through ComSpec.
-          // Use the same executable with the spelling consumed by cmd.exe.
-          ComSpec: executable.replaceAll("/", "\\"),
           USERPROFILE: paths.homeRoot,
           APPDATA: paths.configRoot,
           LOCALAPPDATA: paths.cacheRoot,
@@ -790,28 +713,6 @@ const ghidraLaunchEnvironment = (
     XDG_CONFIG_HOME: paths.configRoot,
     XDG_DATA_HOME: paths.dataRoot,
   };
-};
-
-/** Encode provider-owned JVM paths for the platform launcher that consumes them. */
-export const ghidraHeadlessJavaOptions = (
-  homeRoot: string,
-  tempRoot: string,
-  platform: NodeJS.Platform,
-): Pick<
-  NodeJS.ProcessEnv,
-  "JDK_JAVA_OPTIONS" | "GHIDRA_HEADLESS_JAVA_OPTIONS"
-> => {
-  const options = [`-Duser.home=${homeRoot}`, `-Djava.io.tmpdir=${tempRoot}`];
-  if (platform === "win32")
-    return {
-      JDK_JAVA_OPTIONS: [...options, "-XX:-UsePerfData"]
-        .map((option) => ghidraBatchStep(() => quoteWindowsBatchToken(option)))
-        .join(" "),
-      GHIDRA_HEADLESS_JAVA_OPTIONS: "",
-    };
-  // POSIX launches the JVM directly, so these properties travel as separate
-  // argv items instead of the shell-split analyzeHeadless option list.
-  return { JDK_JAVA_OPTIONS: "", GHIDRA_HEADLESS_JAVA_OPTIONS: "" };
 };
 
 const isAborted = (signal?: AbortSignal): boolean => signal?.aborted === true;
